@@ -1,5 +1,5 @@
 """
-OpenClaw subprocess wrapper for the Agent Evolve Server.
+OpenClaw subprocess wrapper for the agent engine under ``evolve_server``.
 
 Manages the lifecycle of an OpenClaw agent instance:
 - Configures ``openclaw.json`` (model provider, workspace, sandbox)
@@ -32,9 +32,9 @@ class OpenClawRunner:
         fresh: bool = True,
         timeout: int = 600,
         llm_api_key: str = "",
-        llm_base_url: str = "https://api.anthropic.com",
-        llm_model: str = "claude-opus-4-6",
-        llm_api_type: str = "anthropic-messages",
+        llm_base_url: str = "https://api.openai.com/v1",
+        llm_model: str = "gpt-5.4",
+        llm_api_type: str = "openai-completions",
     ) -> None:
         self.openclaw_bin = openclaw_bin
         self.openclaw_home = Path(openclaw_home) if openclaw_home else Path.cwd() / ".openclaw_home"

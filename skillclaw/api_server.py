@@ -3,8 +3,7 @@
 FastAPI proxy server for SkillClaw.
 
 Intercepts LLM requests from Claw agents, injects skills into system
-prompts, forwards to a real LLM API, and optionally collects PRM scores
-and OPD teacher logprobs.
+prompts, forwards to a real LLM API, and optionally collects PRM scores.
 """
 
 from __future__ import annotations
@@ -27,6 +26,7 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from .config import SkillClawConfig
+from .data_formatter import ConversationSample
 from .prm_scorer import PRMScorer
 from .skill_manager import SkillManager
 from .utils import run_llm
@@ -835,6 +835,252 @@ def _anthropic_to_openai_body(body: dict[str, Any]) -> dict[str, Any]:
     return openai_body
 
 
+def _normalize_responses_content(content: Any) -> str:
+    """Flatten Responses-style content blocks to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in {"input_text", "output_text", "text"}:
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        return " ".join(parts)
+    return str(content) if content is not None else ""
+
+
+def _responses_tools_to_openai_tools(tools: Any) -> list[dict]:
+    """Convert Responses function-tool schemas to chat-completions tool schemas."""
+    converted: list[dict] = []
+    if not isinstance(tools, list):
+        return converted
+
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "function":
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            converted.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": str(item.get("description") or ""),
+                        "parameters": item.get("parameters") or {"type": "object", "properties": {}},
+                    },
+                }
+            )
+            continue
+        if item_type == "function" or item.get("function"):
+            converted.append(item)
+    return converted
+
+
+def _responses_to_openai_body(body: dict[str, Any], default_model: str) -> dict[str, Any]:
+    """Convert an OpenAI Responses request body to chat-completions format."""
+    raw_input = body.get("input")
+    if raw_input is None:
+        raise HTTPException(status_code=400, detail="input is required")
+
+    messages: list[dict] = []
+    instructions = body.get("instructions")
+    if instructions is not None:
+        messages.append({"role": "system", "content": _normalize_responses_content(instructions)})
+
+    def _append_tool_call(item: dict[str, Any]) -> None:
+        call_id = str(item.get("call_id") or item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        arguments = item.get("arguments", "{}")
+        if isinstance(arguments, dict):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        elif not isinstance(arguments, str):
+            arguments = str(arguments)
+        arguments = arguments.strip() or "{}"
+        if not call_id or not name:
+            raise HTTPException(status_code=400, detail="function_call items require call_id and name")
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }
+                ],
+            }
+        )
+
+    def _append_tool_output(item: dict[str, Any]) -> None:
+        call_id = str(item.get("call_id") or item.get("tool_call_id") or "").strip()
+        if not call_id:
+            raise HTTPException(status_code=400, detail="function_call_output items require call_id")
+        output = item.get("output", "")
+        if output is None:
+            output = ""
+        if not isinstance(output, str):
+            output = str(output)
+        messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+
+    if isinstance(raw_input, str):
+        messages.append({"role": "user", "content": raw_input})
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=400, detail="input items must be strings or objects")
+
+            item_type = item.get("type")
+            if item_type == "function_call":
+                _append_tool_call(item)
+                continue
+            if item_type == "function_call_output":
+                _append_tool_output(item)
+                continue
+            if item_type == "reasoning":
+                continue
+
+            role = str(item.get("role") or "user").strip() or "user"
+            if role == "tool":
+                _append_tool_output(item)
+                continue
+            messages.append({"role": role, "content": _normalize_responses_content(item.get("content", ""))})
+    else:
+        raise HTTPException(status_code=400, detail="input must be a string or an array")
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="input must produce at least one message")
+
+    openai_body: dict[str, Any] = {
+        "model": body.get("model") or default_model,
+        "messages": messages,
+    }
+    tools = _responses_tools_to_openai_tools(body.get("tools"))
+    if tools:
+        openai_body["tools"] = tools
+    if "temperature" in body:
+        openai_body["temperature"] = body["temperature"]
+    if "top_p" in body:
+        openai_body["top_p"] = body["top_p"]
+    if "tool_choice" in body:
+        openai_body["tool_choice"] = body["tool_choice"]
+    if "parallel_tool_calls" in body:
+        openai_body["parallel_tool_calls"] = body["parallel_tool_calls"]
+    if "max_output_tokens" in body:
+        openai_body["max_tokens"] = body["max_output_tokens"]
+    return openai_body
+
+
+def _responses_function_item_id(call_id: str, index: int) -> str:
+    raw = str(call_id or "").strip()
+    if raw.startswith("fc_"):
+        return raw
+    if raw.startswith("call_") and len(raw) > len("call_"):
+        return f"fc_{raw[len('call_'):]}"
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", raw)
+    if cleaned:
+        return f"fc_{cleaned[:48]}"
+    return f"fc_{index}"
+
+
+def _openai_chat_to_responses_payload(payload: dict[str, Any], model: str) -> dict[str, Any]:
+    """Convert a chat-completions payload to a Responses API payload."""
+    choice = payload.get("choices", [{}])[0]
+    message = choice.get("message", {}) if isinstance(choice.get("message"), dict) else {}
+    content_text = _flatten_message_content(message.get("content", ""))
+    tool_calls = list(message.get("tool_calls") or []) if isinstance(message.get("tool_calls"), list) else []
+
+    output_items: list[dict[str, Any]] = []
+    for idx, tc in enumerate(tool_calls):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+        call_id = str(tc.get("id") or tc.get("call_id") or f"call_{idx}").strip() or f"call_{idx}"
+        arguments = fn.get("arguments", "{}")
+        if isinstance(arguments, dict):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        elif not isinstance(arguments, str):
+            arguments = str(arguments)
+        output_items.append(
+            {
+                "type": "function_call",
+                "id": _responses_function_item_id(call_id, idx),
+                "call_id": call_id,
+                "name": str(fn.get("name") or ""),
+                "arguments": arguments or "{}",
+                "status": "completed",
+            }
+        )
+
+    if content_text or not output_items:
+        output_items.append(
+            {
+                "id": f"msg_{payload.get('id') or 'skillclaw'}_{len(output_items)}",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": content_text, "annotations": []}],
+            }
+        )
+
+    usage = payload.get("usage", {})
+    response_payload = {
+        "id": payload.get("id") or f"resp_skillclaw_{int(time.time() * 1000)}",
+        "object": "response",
+        "created_at": payload.get("created", int(time.time())),
+        "status": "completed",
+        "model": model,
+        "output": output_items,
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "usage": {
+            "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+            "output_tokens": int(usage.get("completion_tokens", 0) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
+        },
+    }
+    if content_text:
+        response_payload["output_text"] = content_text
+    return response_payload
+
+
+def _merge_previous_response_messages(
+    previous_messages: list[dict[str, Any]],
+    current_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge stored response history with the current turn's messages.
+
+    If the current request provides a fresh system/instructions message, keep it
+    as the new leading system prompt and drop older system prompts from history.
+    """
+    if not previous_messages:
+        return list(current_messages)
+    if not current_messages:
+        return list(previous_messages)
+
+    first = current_messages[0]
+    if isinstance(first, dict) and first.get("role") == "system":
+        history_without_system = [
+            msg
+            for msg in previous_messages
+            if not (isinstance(msg, dict) and msg.get("role") == "system")
+        ]
+        return [first, *history_without_system, *current_messages[1:]]
+
+    return [*previous_messages, *current_messages]
+
+
 def _openai_to_anthropic_response(openai_resp: dict[str, Any], model: str) -> dict[str, Any]:
     """Convert an OpenAI chat completion response to Anthropic /v1/messages format."""
     choice = openai_resp.get("choices", [{}])[0]
@@ -875,18 +1121,14 @@ class SkillClawAPIServer:
 
     OpenClaw sends ``X-Session-Id`` and ``X-Turn-Type`` headers with every
     request. The proxy injects skills, records conversation artifacts when
-    enabled, and can attach PRM or teacher-logprob side channels when
-    configured. Side tasks (``turn_type != "main"``) are forwarded but do not
-    generate the main conversation artifact path.
+    enabled, and can attach PRM scoring when configured. Side tasks
+    (``turn_type != "main"``) are forwarded but do not generate the main
+    conversation artifact path.
 
     Parameters
     ----------
     config:
         SkillClawConfig instance.
-        output_queue:
-        Thread-safe queue used by the async rollout worker.
-    submission_enabled:
-        threading.Event that gates sample submission.
     skill_manager:
         Optional SkillManager for injecting skills into system prompts.
     prm_scorer:
@@ -896,20 +1138,17 @@ class SkillClawAPIServer:
     def __init__(
         self,
         config: SkillClawConfig,
-        output_queue: queue.Queue,
-        submission_enabled: threading.Event,
         sampling_client=None,
         skill_manager: Optional[SkillManager] = None,
         prm_scorer: Optional[PRMScorer] = None,
         last_request_tracker=None,
     ):
         self.config = config
-        self.output_queue = output_queue
-        self.submission_enabled = submission_enabled
         self._sampling_client = sampling_client
         self.skill_manager = skill_manager
         self.prm_scorer = prm_scorer
         self._last_request_tracker = last_request_tracker
+        self._last_request_at = time.time()
 
         self._served_model = config.served_model_name
         self._expected_api_key = config.proxy_api_key
@@ -930,13 +1169,13 @@ class SkillClawAPIServer:
         self._turn_counts: dict[str, int] = {}
         self._pending_turn_data: dict[str, dict[int, dict]] = {}  # session → {turn → data}
         self._prm_tasks: dict[str, dict[int, asyncio.Task]] = {}  # session → {turn → task}
-        self._teacher_tasks: dict[str, dict[int, asyncio.Task]] = {}  # session → {turn → task} (OPD)
         self._pending_records: dict[str, dict] = {}               # for record logging
         self._session_effective: dict[str, int] = {}              # at-least-one guarantee
         self._session_turns: dict[str, list] = {}
         self._session_last_active: dict[str, float] = {}          # session -> unix_ts
         self._closing_sessions: set[str] = set()                  # session ids currently being closed
         self._background_tasks: set[asyncio.Task] = set()         # transient async tasks (upload, submit)
+        self._responses_store: dict[str, dict[str, Any]] = {}     # response_id -> stored response/history
         self._session_sweeper_task: Optional[asyncio.Task] = None
         self._session_idle_close_seconds = max(
             0,
@@ -956,25 +1195,6 @@ class SkillClawAPIServer:
         self._tui_session_meta: dict[str, dict] = {}
         _INACTIVITY_TIMEOUT = 300  # seconds — treat as new session after 5 min idle
         self._tui_inactivity_timeout = _INACTIVITY_TIMEOUT
-
-        # OPD teacher model client
-        self._teacher_client: Optional[Any] = None
-        if config.use_opd and config.teacher_url:
-            try:
-                from openai import OpenAI
-            except ImportError as e:
-                raise ImportError(
-                    "OPD teacher mode requires the 'openai' package. "
-                    "Install it with: pip install openai"
-                ) from e
-            self._teacher_client = OpenAI(
-                base_url=config.teacher_url,
-                api_key=config.teacher_api_key or "unused",
-            )
-            logger.info("[OpenClaw] OPD teacher client ready: url=%s model=%s",
-                        config.teacher_url, config.teacher_model)
-        elif config.use_opd and not config.teacher_url:
-            logger.warning("[OpenClaw] use_opd=True but teacher_url is empty — teacher logprobs disabled")
 
         # Record files
         self._record_file = ""
@@ -1067,18 +1287,8 @@ class SkillClawAPIServer:
         ):
             owner: SkillClawAPIServer = request.app.state.owner
             # Update idle tracker so the scheduler knows the user is active
-            if owner._last_request_tracker is not None:
-                owner._last_request_tracker.touch()
+            owner._mark_request_activity()
             await owner._check_auth(authorization)
-            if not owner.submission_enabled.is_set():
-                # Queue requests while submission is paused instead of returning 503.
-                # Use a bounded wait so clients don't hang forever on abnormal stalls.
-                resumed = await asyncio.to_thread(owner.submission_enabled.wait, 300.0)
-                if not resumed:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="submission paused for weight update (wait timeout)",
-                    )
 
             body = await request.json()
             incoming_messages = body.get("messages", [])
@@ -1123,6 +1333,102 @@ class SkillClawAPIServer:
                 )
             return JSONResponse(content=result["response"])
 
+        @app.post("/v1/responses")
+        async def responses(
+            request: Request,
+            authorization: Optional[str] = Header(default=None),
+            x_session_id: Optional[str] = Header(default=None),
+            x_turn_type: Optional[str] = Header(default=None),
+            x_session_done: Optional[str] = Header(default=None),
+        ):
+            owner: SkillClawAPIServer = request.app.state.owner
+            owner._mark_request_activity()
+            await owner._check_auth(authorization)
+
+            body = await request.json()
+            previous_response_id = str(body.get("previous_response_id") or "").strip()
+            store_response = bool(body.get("store", True))
+            openai_body = _responses_to_openai_body(body, owner._served_model)
+            if previous_response_id:
+                stored = owner._responses_store.get(previous_response_id)
+                if stored is None:
+                    raise HTTPException(status_code=404, detail=f"previous_response_id not found: {previous_response_id}")
+                openai_body["messages"] = _merge_previous_response_messages(
+                    list(stored.get("messages") or []),
+                    list(openai_body.get("messages") or []),
+                )
+            _raw_sid = x_session_id or body.get("session_id") or ""
+            if _raw_sid:
+                session_id = _raw_sid
+                turn_type = _resolve_turn_type(
+                    x_turn_type, body.get("turn_type"), default="main"
+                )
+            else:
+                msg_count = len(openai_body.get("messages") or [])
+                session_id = await owner._resolve_tui_session(
+                    openai_body.get("model", owner._served_model), msg_count,
+                )
+                turn_type = _resolve_turn_type(
+                    x_turn_type, body.get("turn_type"), default="main"
+                )
+            session_done = _resolve_session_done(x_session_done, body.get("session_done"))
+
+            result = await owner._handle_request(
+                openai_body,
+                session_id=session_id,
+                turn_type=turn_type,
+                session_done=session_done,
+            )
+            response_payload = _openai_chat_to_responses_payload(
+                result["response"],
+                model=openai_body.get("model", owner._served_model),
+            )
+            assistant_message = (
+                result.get("response", {}).get("choices", [{}])[0].get("message", {})
+                if isinstance(result.get("response"), dict)
+                else {}
+            )
+            if store_response:
+                owner._responses_store[response_payload["id"]] = {
+                    "response": response_payload,
+                    "messages": [
+                        *list(openai_body.get("messages") or []),
+                        assistant_message if isinstance(assistant_message, dict) else {},
+                    ],
+                }
+            if bool(body.get("stream", False)):
+                return StreamingResponse(
+                    owner._stream_responses_response(response_payload),
+                    media_type="text/event-stream",
+                )
+            return JSONResponse(content=response_payload)
+
+        @app.get("/v1/responses/{response_id}")
+        async def get_response(
+            response_id: str,
+            request: Request,
+            authorization: Optional[str] = Header(default=None),
+        ):
+            owner: SkillClawAPIServer = request.app.state.owner
+            await owner._check_auth(authorization)
+            stored = owner._responses_store.get(response_id)
+            if stored is None:
+                raise HTTPException(status_code=404, detail="response not found")
+            return JSONResponse(content=stored["response"])
+
+        @app.delete("/v1/responses/{response_id}")
+        async def delete_response(
+            response_id: str,
+            request: Request,
+            authorization: Optional[str] = Header(default=None),
+        ):
+            owner: SkillClawAPIServer = request.app.state.owner
+            await owner._check_auth(authorization)
+            stored = owner._responses_store.pop(response_id, None)
+            if stored is None:
+                raise HTTPException(status_code=404, detail="response not found")
+            return JSONResponse(content={"id": response_id, "object": "response", "deleted": True})
+
         # ---------------------------------------------------------------- #
         # Anthropic-compatible endpoint — used by NanoClaw (credential proxy
         # forwards container Anthropic SDK calls to ANTHROPIC_BASE_URL).
@@ -1138,19 +1444,10 @@ class SkillClawAPIServer:
             x_session_done: Optional[str] = Header(default=None),
         ):
             owner: SkillClawAPIServer = request.app.state.owner
-            if owner._last_request_tracker is not None:
-                owner._last_request_tracker.touch()
+            owner._mark_request_activity()
             # Accept Anthropic-style x-api-key as well as Bearer token.
             auth_header = authorization or (f"Bearer {x_api_key}" if x_api_key else None)
             await owner._check_auth(auth_header)
-
-            if not owner.submission_enabled.is_set():
-                resumed = await asyncio.to_thread(owner.submission_enabled.wait, 300.0)
-                if not resumed:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="submission paused for weight update (wait timeout)",
-                    )
 
             raw_body = await request.json()
             stream = bool(raw_body.get("stream", False))
@@ -1199,6 +1496,31 @@ class SkillClawAPIServer:
         token = authorization.split(" ", 1)[1].strip()
         if token != self._expected_api_key:
             raise HTTPException(status_code=401, detail="invalid api key")
+
+    def _mark_request_activity(self) -> None:
+        self._last_request_at = time.time()
+        if self._last_request_tracker is not None:
+            try:
+                self._last_request_tracker.touch()
+            except Exception:
+                pass
+
+    def last_request_age_seconds(self) -> Optional[float]:
+        last = getattr(self, "_last_request_at", None)
+        if last is None:
+            return None
+        return max(0.0, time.time() - float(last))
+
+    def active_session_count(self) -> int:
+        return len(self._collect_active_session_ids())
+
+    def is_idle_for_validation(self, idle_after_seconds: int) -> bool:
+        age = self.last_request_age_seconds()
+        if age is None:
+            return False
+        if self.active_session_count() > 0:
+            return False
+        return age >= max(0, int(idle_after_seconds))
 
     # ------------------------------------------------------------------ #
     # TUI session boundary detection (CoPaw / IronClaw / generic clients)  #
@@ -1276,7 +1598,6 @@ class SkillClawAPIServer:
         session_ids.update(self._turn_counts.keys())
         session_ids.update(self._session_effective.keys())
         session_ids.update(self._prm_tasks.keys())
-        session_ids.update(self._teacher_tasks.keys())
         return sorted(s for s in session_ids if s and s not in self._closing_sessions)
 
     def _collect_idle_session_ids(self, now: Optional[float] = None) -> list[str]:
@@ -1384,27 +1705,15 @@ class SkillClawAPIServer:
                         prm_result = prm_task.result()
                     except (asyncio.CancelledError, Exception):
                         prm_result = None
-                teacher_logprobs = None
-                teacher_task = self._teacher_tasks.get(session_id, {}).get(turn_num)
-                if teacher_task is not None and teacher_task.done():
-                    try:
-                        teacher_logprobs = teacher_task.result()
-                    except (asyncio.CancelledError, Exception):
-                        teacher_logprobs = None
                 await self._submit_turn_sample(
                     turn_num,
                     turn_data,
                     session_id,
                     prm_result,
-                    teacher_logprobs,
                 )
             eff = self._session_effective.pop(session_id, 0)
             self._turn_counts.pop(session_id, None)
             self._pending_turn_data.pop(session_id, None)
-            teacher_tasks = self._teacher_tasks.pop(session_id, {})
-            for task in teacher_tasks.values():
-                if isinstance(task, asyncio.Task) and not task.done():
-                    task.cancel()
             prm_tasks = self._prm_tasks.pop(session_id, {})
             for task in prm_tasks.values():
                 if isinstance(task, asyncio.Task) and not task.done():
@@ -1583,65 +1892,6 @@ class SkillClawAPIServer:
         self._apply_prm_result(session_id, turn_num, prm_result)
 
     # ------------------------------------------------------------------ #
-    # OPD teacher logprobs                                                 #
-    # ------------------------------------------------------------------ #
-
-    async def _query_teacher_logprobs(
-        self, prompt_text: str, response_text: str, num_response_tokens: int
-    ) -> list[float]:
-        """Query teacher model for per-token logprobs on the student's response.
-
-        Uses the OpenAI-compatible ``/v1/completions`` endpoint with ``echo=True``
-        and ``max_tokens=0`` to obtain the teacher's log-probabilities for each
-        token of the student's generated response without producing new tokens.
-        """
-        full_text = prompt_text + response_text
-
-        response = await asyncio.to_thread(
-            self._teacher_client.completions.create,
-            model=self.config.teacher_model,
-            prompt=full_text,
-            echo=True,
-            logprobs=1,
-            max_tokens=0,
-        )
-
-        choice = response.choices[0]
-        token_logprobs = choice.logprobs.token_logprobs or []
-
-        # Find where response tokens start (use student tokenizer as reference)
-        prompt_token_count = len(
-            self._tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-        )
-
-        teacher_lps = [
-            float(lp) if lp is not None else 0.0
-            for lp in token_logprobs[prompt_token_count:]
-        ]
-
-        # Align to student's response token count
-        if len(teacher_lps) > num_response_tokens:
-            teacher_lps = teacher_lps[:num_response_tokens]
-        elif len(teacher_lps) < num_response_tokens:
-            teacher_lps = teacher_lps + [0.0] * (num_response_tokens - len(teacher_lps))
-
-        return teacher_lps
-
-    def _fire_teacher_query(
-        self, session_id: str, turn_num: int,
-        prompt_text: str, response_text: str, num_response_tokens: int,
-    ):
-        """Fire an async teacher-logprobs query (OPD mode)."""
-        task = asyncio.create_task(
-            self._query_teacher_logprobs(prompt_text, response_text, num_response_tokens)
-        )
-        task.add_done_callback(self._task_done_cb)
-        task.add_done_callback(
-            lambda _t: self._maybe_submit_ready_samples(session_id)
-        )
-        self._teacher_tasks.setdefault(session_id, {})[turn_num] = task
-
-    # ------------------------------------------------------------------ #
     # Request handling                                                     #
     # ------------------------------------------------------------------ #
 
@@ -1764,6 +2014,7 @@ class SkillClawAPIServer:
         forward_body["messages"] = messages  # potentially skill-injected
 
         output = await self._forward_to_llm(forward_body)
+        output["model"] = forward_body.get("model") or self._served_model
 
         choice = output.get("choices", [{}])[0]
         assistant_msg = choice.get("message", {})
@@ -1946,10 +2197,6 @@ class SkillClawAPIServer:
                 "prm_score": None,
             })
             self._pending_turn_data.setdefault(session_id, {})[turn_num] = turn_data
-            if self.config.use_opd and self._teacher_client:
-                self._fire_teacher_query(
-                    session_id, turn_num, prompt_text, response_text, len(response_ids),
-                )
             self._maybe_submit_ready_samples(session_id)
         else:
             logger.info("[OpenClaw] SIDE session=%s → skipped (no training data)", session_id)
@@ -2340,7 +2587,6 @@ class SkillClawAPIServer:
         When force is active, pending teacher tasks are also skipped.
         """
         prm_tasks = self._prm_tasks.setdefault(session_id, {})
-        teacher_tasks = self._teacher_tasks.setdefault(session_id, {})
         pending = self._pending_turn_data.get(session_id, {})
         for turn_num in sorted(list(pending.keys())):
             # --- PRM readiness ---
@@ -2369,12 +2615,6 @@ class SkillClawAPIServer:
             elif prm_task is None and not force_no_prm:
                 continue  # waiting for next_state to fire PRM
 
-            # --- Teacher readiness (OPD) ---
-            teacher_task = teacher_tasks.get(turn_num)
-            if (self.config.use_opd and teacher_task is not None
-                    and not teacher_task.done() and not force_no_prm):
-                continue  # teacher logprobs still running
-
             turn_data = pending.pop(turn_num)
             prm_result = None
             cached_prm_result = turn_data.pop("prm_result", None)
@@ -2387,21 +2627,12 @@ class SkillClawAPIServer:
                     pass
                 prm_tasks.pop(turn_num, None)
 
-            teacher_logprobs = None
-            if teacher_task is not None and teacher_task.done():
-                try:
-                    teacher_logprobs = teacher_task.result()
-                except (asyncio.CancelledError, Exception):
-                    pass
-                teacher_tasks.pop(turn_num, None)
-
             self._safe_create_task(
                 self._submit_turn_sample(
                     turn_num,
                     turn_data,
                     session_id,
                     prm_result,
-                    teacher_logprobs,
                 )
             )
 
@@ -2417,7 +2648,6 @@ class SkillClawAPIServer:
         session cleanup continues.
         """
         prm_tasks = self._prm_tasks.setdefault(session_id, {})
-        teacher_tasks = self._teacher_tasks.setdefault(session_id, {})
         pending = self._pending_turn_data.get(session_id, {})
         for turn_num in sorted(list(pending.keys())):
             prm_task = prm_tasks.get(turn_num)
@@ -2426,11 +2656,6 @@ class SkillClawAPIServer:
             elif prm_task is not None and not prm_task.done():
                 continue
             elif prm_task is None and not force_no_prm:
-                continue
-
-            teacher_task = teacher_tasks.get(turn_num)
-            if (self.config.use_opd and teacher_task is not None
-                    and not teacher_task.done() and not force_no_prm):
                 continue
 
             turn_data = pending.pop(turn_num)
@@ -2445,20 +2670,11 @@ class SkillClawAPIServer:
                     pass
                 prm_tasks.pop(turn_num, None)
 
-            teacher_logprobs = None
-            if teacher_task is not None and teacher_task.done():
-                try:
-                    teacher_logprobs = teacher_task.result()
-                except (asyncio.CancelledError, Exception):
-                    pass
-                teacher_tasks.pop(turn_num, None)
-
             await self._submit_turn_sample(
                 turn_num,
                 turn_data,
                 session_id,
                 prm_result,
-                teacher_logprobs,
             )
 
     async def _submit_turn_sample(
@@ -2467,7 +2683,6 @@ class SkillClawAPIServer:
         turn_data: dict[str, Any],
         session_id: str,
         prm_result: Optional[dict],
-        teacher_logprobs: Optional[list[float]] = None,
     ):
         prompt_ids = turn_data["prompt_ids"]
         response_ids = turn_data["response_ids"]
@@ -2486,7 +2701,6 @@ class SkillClawAPIServer:
             )
 
         loss_mask = [0] * len(response_ids) if exclude else [1] * len(response_ids)
-        from .data_formatter import ConversationSample  # optional tokenized sample export
         sample = ConversationSample(
             session_id=session_id,
             turn_num=turn_num,
@@ -2497,7 +2711,6 @@ class SkillClawAPIServer:
             reward=score,
             prompt_text=turn_data.get("prompt_text", ""),
             response_text=turn_data.get("response_text", ""),
-            teacher_logprobs=teacher_logprobs,
             skill_generation=self.skill_manager.generation if self.skill_manager else 0,
         )
 
@@ -2519,7 +2732,6 @@ class SkillClawAPIServer:
             "prompt_len=%d response_len=%d",
             session_id, turn_num, index, score, exclude, len(prompt_ids), len(response_ids),
         )
-        await asyncio.to_thread(self.output_queue.put, (group_index, [sample]))
 
     # ------------------------------------------------------------------ #
     # Streaming                                                            #
@@ -2546,6 +2758,117 @@ class SkillClawAPIServer:
         }
         yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def _stream_responses_response(self, response_payload: dict[str, Any]):
+        """Yield OpenAI Responses API-compatible SSE events."""
+        seq = 0
+
+        def _event(payload: dict[str, Any]) -> str:
+            nonlocal seq
+            payload["sequence_number"] = seq
+            seq += 1
+            return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+        initial_response = dict(response_payload)
+        initial_response["status"] = "in_progress"
+        initial_response["output"] = []
+        initial_response["usage"] = None
+        yield _event({"type": "response.created", "response": initial_response})
+        yield _event({"type": "response.in_progress", "response": initial_response})
+
+        for index, item in enumerate(response_payload.get("output", [])):
+            yield _event(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": index,
+                    "item": item,
+                }
+            )
+
+            if item.get("type") == "function_call":
+                arguments = str(item.get("arguments") or "")
+                if arguments:
+                    yield _event(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item.get("id", ""),
+                            "output_index": index,
+                            "delta": arguments,
+                        }
+                    )
+                yield _event(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item.get("id", ""),
+                        "output_index": index,
+                        "arguments": arguments,
+                    }
+                )
+
+            if item.get("type") == "message":
+                for content_index, part in enumerate(item.get("content", [])):
+                    if part.get("type") != "output_text":
+                        continue
+                    item_id = str(item.get("id") or "")
+                    base_part = {
+                        "type": "output_text",
+                        "text": "",
+                        "annotations": [],
+                    }
+                    yield _event(
+                        {
+                            "type": "response.content_part.added",
+                            "output_index": index,
+                            "content_index": content_index,
+                            "item_id": item_id,
+                            "part": base_part,
+                        }
+                    )
+                    text = str(part.get("text") or "")
+                    if text:
+                        yield _event(
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": index,
+                                "content_index": content_index,
+                                "item_id": item_id,
+                                "delta": text,
+                                "logprobs": [],
+                            }
+                        )
+                    yield _event(
+                        {
+                            "type": "response.output_text.done",
+                            "output_index": index,
+                            "content_index": content_index,
+                            "item_id": item_id,
+                            "text": text,
+                            "logprobs": [],
+                        }
+                    )
+                    yield _event(
+                        {
+                            "type": "response.content_part.done",
+                            "output_index": index,
+                            "content_index": content_index,
+                            "item_id": item_id,
+                            "part": {
+                                "type": "output_text",
+                                "text": text,
+                                "annotations": [],
+                            },
+                        }
+                    )
+            yield _event(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": index,
+                    "item": item,
+                }
+            )
+
+        yield _event({"type": "response.completed", "response": response_payload})
         yield "data: [DONE]\n\n"
 
     async def _stream_anthropic_response(self, result: dict[str, Any], model: str):

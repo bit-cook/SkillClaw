@@ -1,5 +1,5 @@
 """
-Workspace management for the Agent Evolve Server.
+Workspace management for the agent engine under ``evolve_server``.
 
 Handles preparing the local workspace directory that OpenClaw operates on,
 snapshotting skill state before agent execution, and collecting changes
@@ -22,7 +22,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from evolve_server.utils import parse_skill_content
+from ..core.utils import parse_skill_content
 
 logger = logging.getLogger(__name__)
 

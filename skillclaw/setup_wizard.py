@@ -157,7 +157,7 @@ class SetupWizard:
         else:
             bedrock_region = ""
             api_base = _prompt(
-                "API base URL",
+                "API base URL [http://api.example.com/v1]",
                 default=current_llm.get("api_base") or preset["api_base"],
             )
             model_id = _prompt(
@@ -239,35 +239,6 @@ class SetupWizard:
                 "url": prm_url,
                 "model": prm_model,
                 "api_key": prm_api_key,
-            }
-
-        # ---- OPD ----
-        print("\n--- OPD (Teacher Logprobs) ---")
-        current_opd = existing.get("opd", {})
-        opd_enabled = _prompt_bool(
-            "Enable OPD teacher logprobs collection",
-            default=current_opd.get("enabled", False),
-        )
-        opd_config: dict = {"enabled": False}
-        if opd_enabled:
-            teacher_url = _prompt(
-                "Teacher model URL",
-                default=current_opd.get("teacher_url", ""),
-            )
-            teacher_model = _prompt(
-                "Teacher model ID",
-                default=current_opd.get("teacher_model", ""),
-            )
-            teacher_api_key = _prompt(
-                "Teacher API key",
-                default=current_opd.get("teacher_api_key", ""),
-                hide=True,
-            )
-            opd_config = {
-                "enabled": True,
-                "teacher_url": teacher_url,
-                "teacher_model": teacher_model,
-                "teacher_api_key": teacher_api_key,
             }
 
         # ---- Sharing ----
@@ -354,15 +325,23 @@ class SetupWizard:
         # ---- Proxy port ----
         print("\n--- Proxy Configuration ---")
         current_proxy = existing.get("proxy", {})
+        default_served_model_name = str(
+            current_proxy.get("served_model_name")
+            or "skillclaw-model"
+        )
+        served_model_name = _prompt(
+            "Proxy model name exposed to agents",
+            default=default_served_model_name,
+        )
         proxy_port = _prompt_int("Proxy port", default=current_proxy.get("port", 30000))
 
         # ---- Write config ----
         proxy_config = dict(current_proxy)
         proxy_config["port"] = proxy_port
         proxy_config.setdefault("host", "0.0.0.0")
+        proxy_config["served_model_name"] = served_model_name or "skillclaw-model"
         data = {
             "claw_type": claw_type,
-            "mode": "skills_only",
             "llm": {
                 "provider": provider,
                 "model_id": model_id,
@@ -379,7 +358,6 @@ class SetupWizard:
                 "top_k": current_skills.get("top_k", 6),
             },
             "prm": prm_config,
-            "opd": opd_config,
             "sharing": sharing_config,
         }
 

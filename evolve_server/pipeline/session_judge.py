@@ -15,7 +15,7 @@ import logging
 import re
 from typing import Any, Optional
 
-from .llm_client import AsyncLLMClient
+from ..core.llm_client import AsyncLLMClient
 
 logger = logging.getLogger(__name__)
 

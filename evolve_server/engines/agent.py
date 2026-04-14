@@ -1,12 +1,5 @@
 """
-AgentEvolveServer — agent-driven skill evolution orchestrator.
-
-Replaces the fixed summarize -> aggregate -> execute pipeline in
-``evolve_server`` with an OpenClaw agent that autonomously reads session
-data, analyzes patterns, and writes evolved SKILL.md files.
-
-External interface (``run_once``, ``run_periodic``, ``create_http_app``)
-is identical to ``evolve_server.server.EvolveServer``.
+Agent-driven evolve server implementation inside the unified package.
 """
 
 from __future__ import annotations
@@ -22,10 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from evolve_server.constants import SLUG_RE
-from evolve_server.llm_client import AsyncLLMClient
-from evolve_server.mock_bucket import LocalBucket
-from evolve_server.oss_helpers import (
+from ..core.constants import SLUG_RE
+from ..core.llm_client import AsyncLLMClient
+from ..storage.mock_bucket import LocalBucket
+from ..storage.oss_helpers import (
     delete_session_keys,
     fetch_skill_content,
     list_session_keys,
@@ -33,19 +26,19 @@ from evolve_server.oss_helpers import (
     read_json_object,
     save_manifest,
 )
-from evolve_server.skill_registry import SkillIDRegistry
-from evolve_server.summarizer import (
+from ..core.skill_registry import SkillIDRegistry
+from ..pipeline.summarizer import (
     _extract_session_metadata,
     build_session_trajectory,
     summarize_sessions_parallel,
 )
-from evolve_server.utils import build_skill_md
+from ..core.utils import build_skill_md
 from skillclaw.object_store import build_object_store
 
 from .agents_md import load_agents_md
-from .config import AgentEvolveServerConfig
+from ..core.config import EvolveServerConfig
 from .openclaw_runner import OpenClawRunner
-from .workspace import AgentWorkspace
+from .agent_workspace import AgentWorkspace
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +50,7 @@ class _AnthropicMessagesLLMClient:
         self,
         api_key: str = "",
         base_url: str = "https://api.anthropic.com",
-        model: str = "claude-opus-4-6",
+        model: str = "gpt-5.4",
         max_tokens: int = 100000,
         temperature: float = 0.4,
     ) -> None:
@@ -146,12 +139,12 @@ class AgentEvolveServer:
     mock:
         If ``True``, use a local directory instead of remote storage.
     mock_root:
-        Custom root for mock mode (default: ``agent_evolve_server/mock/``).
+        Custom root for mock mode (default: ``evolve_server/mock/``).
     """
 
     def __init__(
         self,
-        config: AgentEvolveServerConfig,
+        config: EvolveServerConfig,
         *,
         mock: bool = False,
         mock_root: str | None = None,
@@ -311,7 +304,7 @@ class AgentEvolveServer:
             "skill_id": skill_id,
             "version": version,
             "sha256": content_sha,
-            "uploaded_by": "agent_evolve_server",
+            "uploaded_by": "evolve_server",
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
             "description": skill.get("description", ""),
             "category": skill.get("category", "general"),

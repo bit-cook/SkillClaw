@@ -4,6 +4,7 @@ Claw adapter: auto-configures the active CLI agent to use the SkillClaw proxy.
 
 Supported agents:
   openclaw  — runs `openclaw config set …` + `openclaw gateway restart`
+  hermes    — patches ~/.hermes/config.yaml to point model traffic at SkillClaw
   copaw     — patches ~/.copaw/config.json, triggers daemon hot-reload
   ironclaw  — patches ~/.ironclaw/.env, runs `ironclaw service restart`
   picoclaw  — patches ~/.picoclaw/config.json model_list, runs `picoclaw gateway restart`
@@ -21,10 +22,14 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import platform
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+
+import yaml
 
 if TYPE_CHECKING:
     from .config import SkillClawConfig
@@ -60,7 +65,7 @@ def configure_claw(cfg: "SkillClawConfig") -> None:
 
 def _configure_openclaw(cfg: "SkillClawConfig") -> None:
     """Auto-configure OpenClaw to use the SkillClaw proxy."""
-    model_id = cfg.llm_model_id or cfg.served_model_name or "skillclaw-model"
+    model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
     provider_json = json.dumps({
         "api": "openai-completions",
         "baseUrl": f"http://127.0.0.1:{cfg.proxy_port}/v1",
@@ -88,6 +93,81 @@ def _configure_openclaw(cfg: "SkillClawConfig") -> None:
 
 
 # ------------------------------------------------------------------ #
+# Hermes adapter                                                      #
+# ------------------------------------------------------------------ #
+
+def _load_yaml_mapping(path: Path, label: str) -> dict:
+    """Load a YAML mapping, falling back to an empty mapping."""
+    if not path.exists():
+        return {}
+
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        logger.warning("[ClawAdapter] Failed to read %s config %s: %s", label, path, e)
+        return {}
+
+    if isinstance(loaded, dict):
+        return loaded
+
+    logger.warning(
+        "[ClawAdapter] %s config %s is not a mapping; replacing it",
+        label,
+        path,
+    )
+    return {}
+
+
+def _write_yaml_mapping_atomic(path: Path, data: dict, label: str) -> None:
+    """Atomically write a YAML mapping to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            yaml.safe_dump(data, handle, sort_keys=False, allow_unicode=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        logger.info("[ClawAdapter] %s config updated: %s", label, path)
+    except Exception as e:
+        logger.error("[ClawAdapter] Failed to write %s config %s: %s", label, path, e)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _configure_hermes(cfg: "SkillClawConfig") -> None:
+    """Auto-configure Hermes to route model traffic through SkillClaw."""
+    config_path = Path.home() / ".hermes" / "config.yaml"
+    model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
+    api_key = cfg.proxy_api_key or "skillclaw"
+    base_url = f"http://127.0.0.1:{cfg.proxy_port}/v1"
+
+    data = _load_yaml_mapping(config_path, "Hermes")
+    model = data.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if isinstance(model, str) and model.strip() else {}
+
+    model["provider"] = "custom"
+    model["base_url"] = base_url
+    model["default"] = model_id
+    model["api_key"] = api_key
+    # Clear stale provider-specific mode so Hermes auto-detects from the proxy URL.
+    model["api_mode"] = ""
+
+    data["model"] = model
+    _write_yaml_mapping_atomic(config_path, data, "Hermes")
+
+
+# ------------------------------------------------------------------ #
 # CoPaw adapter                                                       #
 # ------------------------------------------------------------------ #
 
@@ -100,7 +180,7 @@ def _configure_copaw(cfg: "SkillClawConfig") -> None:
     as a fallback for instant effect.
     """
     config_path = Path.home() / ".copaw" / "config.json"
-    model_id = cfg.llm_model_id or cfg.served_model_name or "skillclaw-model"
+    model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
 
     # Load existing config or start fresh
     data: dict = {}
@@ -148,7 +228,7 @@ def _configure_ironclaw(cfg: "SkillClawConfig") -> None:
     restart so the new env vars take effect immediately.
     """
     env_path = Path.home() / ".ironclaw" / ".env"
-    model_id = cfg.llm_model_id or cfg.served_model_name or "skillclaw-model"
+    model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
 
     new_vars = {
         "LLM_BACKEND": "openai_compatible",
@@ -216,7 +296,7 @@ def _configure_picoclaw(cfg: "SkillClawConfig") -> None:
     ``agents.defaults.model_name``.
     """
     config_path = Path.home() / ".picoclaw" / "config.json"
-    model_id = cfg.llm_model_id or cfg.served_model_name or "skillclaw-model"
+    model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
 
     data: dict = {}
     if config_path.exists():
@@ -280,7 +360,7 @@ def _configure_zeroclaw(cfg: "SkillClawConfig") -> None:
     write library.
     """
     config_path = Path.home() / ".zeroclaw" / "config.toml"
-    model_id = cfg.llm_model_id or cfg.served_model_name or "skillclaw-model"
+    model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
 
     new_vars = {
         "provider": "openai-compatible",
@@ -448,7 +528,7 @@ def _configure_nemoclaw(cfg: "SkillClawConfig") -> None:
     The config is also persisted to ~/.nemoclaw/config.json so that
     `openclaw nemoclaw status` reflects the current state.
     """
-    model_id = cfg.llm_model_id or cfg.served_model_name or "skillclaw-model"
+    model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
     api_key = cfg.proxy_api_key or "skillclaw"
     base_url = f"http://127.0.0.1:{cfg.proxy_port}/v1"
 
@@ -541,6 +621,7 @@ def _configure_none(cfg: "SkillClawConfig") -> None:
 
 _ADAPTERS: dict[str, Callable[["SkillClawConfig"], None]] = {
     "openclaw": _configure_openclaw,
+    "hermes": _configure_hermes,
     "copaw": _configure_copaw,
     "ironclaw": _configure_ironclaw,
     "picoclaw": _configure_picoclaw,

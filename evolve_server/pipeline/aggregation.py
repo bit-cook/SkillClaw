@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 
-from .constants import NO_SKILL_KEY
+from ..core.constants import NO_SKILL_KEY
 
 logger = logging.getLogger(__name__)
 

@@ -15,8 +15,8 @@ import json
 import logging
 from typing import Any
 
-from .llm_client import AsyncLLMClient
-from .utils import compact_tool_calls, compact_tool_observations
+from ..core.llm_client import AsyncLLMClient
+from ..core.utils import compact_tool_calls, compact_tool_observations
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +250,9 @@ misleading.
 Output ONLY the plain-text summary — no JSON, no markdown fences.
 """
 
+_SUMMARY_PROMPT_MAX_CHARS = 2000
+_SUMMARY_RESPONSE_MAX_CHARS = 2000
+
 
 def _build_session_payload(session: dict) -> dict[str, Any]:
     """Build a compact representation of the session for the LLM.
@@ -258,16 +261,18 @@ def _build_session_payload(session: dict) -> dict[str, Any]:
     included; subsequent turns with the same prompt get ``prompt: "(same)"``.
     """
     turns = session.get("turns", [])
-    first_prompt = (turns[0].get("prompt_text") or "")[:500] if turns else ""
+    first_prompt = (turns[0].get("prompt_text") or "")[:_SUMMARY_PROMPT_MAX_CHARS] if turns else ""
     interactions: list[dict[str, Any]] = []
 
     for idx, t in enumerate(turns):
-        raw_prompt = (t.get("prompt_text") or "")[:500]
+        raw_prompt = (t.get("prompt_text") or "")[:_SUMMARY_PROMPT_MAX_CHARS]
         prompt = raw_prompt if idx == 0 else ("(same)" if raw_prompt == first_prompt else raw_prompt)
 
         interaction: dict[str, Any] = {
             "prompt": prompt,
-            "response": (t.get("response_text") or "")[:400],
+            # Keep enough tail content for command-heavy sessions where the
+            # decisive environment knowledge often appears near the end.
+            "response": (t.get("response_text") or "")[:_SUMMARY_RESPONSE_MAX_CHARS],
             "prm_score": t.get("prm_score"),
         }
         # Carry rollout metadata so the summarizer can reason per-rollout

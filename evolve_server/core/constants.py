@@ -20,11 +20,11 @@ class FailureType(IntEnum):
 
 
 FAILURE_LABELS: dict[int, str] = {
-    FailureType.SKILL_CONTENT_STALE: "Skill 内容失效",
-    FailureType.SKILL_MISSELECT: "Skill 误选",
-    FailureType.SKILL_GAP: "Skill 缺口",
-    FailureType.TOOL_ERROR: "工具使用错误",
-    FailureType.MODEL_BASELINE: "模型基础能力",
+    FailureType.SKILL_CONTENT_STALE: "Skill content stale",
+    FailureType.SKILL_MISSELECT: "Skill misselected",
+    FailureType.SKILL_GAP: "Skill gap",
+    FailureType.TOOL_ERROR: "Tool usage error",
+    FailureType.MODEL_BASELINE: "Model baseline capability",
 }
 
 

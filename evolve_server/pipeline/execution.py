@@ -16,9 +16,9 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .constants import DecisionAction
-from .llm_client import AsyncLLMClient
-from .utils import parse_single_skill
+from ..core.constants import DecisionAction
+from ..core.llm_client import AsyncLLMClient
+from ..core.utils import parse_single_skill
 
 logger = logging.getLogger(__name__)
 
